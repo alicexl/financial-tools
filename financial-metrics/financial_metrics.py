@@ -354,11 +354,12 @@ def _find_section_pages(doc, start_marker, stop_markers: list[str],
 def build_yearly_dataset(pdfs: list[tuple[int, str]]) -> dict[int, dict[str, float]]:
     """
     每份年报 N 提供 (本期=year=N, 上期=year=N-1) 两份数据。
-    合并规则: 每个年份的数据来自「包含该年份的最新年报」——
-    即从最新年报开始倒序遍历，仅在该年份尚未有数据时填入。
+    合并规则: 自家年报的「本期」优先于次年年报的「上期」——
+    即年份 N 的数据优先取自 N 年报的本期（原始披露），
+    仅在 N 年报缺失时才退用 N+1 年报的上期对照列（可能已重述）。
 
-    跨 PDF 单位一致性: 若同一年的数据在不同 PDF 里差 1000 倍，
-    说明其中一份的单位未识别（默认按元处理但实际是千元），自动补正。
+    跨 PDF 单位一致性: 若同一年的数据在不同 PDF 里差 1000/10000 倍，
+    说明其中一份的单位未识别（默认按元处理但实际是千元/万元），自动补正。
     """
     # Phase 1: 各 PDF 独立解析
     parsed_list: list[tuple[int, dict[str, list[float]]]] = [
@@ -406,18 +407,26 @@ def build_yearly_dataset(pdfs: list[tuple[int, str]]) -> dict[int, dict[str, flo
             new_parsed_list.append((src_year, parsed))
         parsed_list = new_parsed_list
 
-    # Phase 3: 多年合并（倒序，最新优先）
+    # Phase 3: 多年合并
+    # 优先级: 自家年报本期 > 次年年报上期（重述值）
+    # - 同一控制下企业合并 / 会计政策变更时，次年 PDF 的"上期"是重述后数据，
+    #   与当年 PDF 的"本期"（原始披露）可能不同。默认采用原始披露。
+    # - Pass A 先填各 PDF 的本期（unique to its year，无冲突）
+    # - Pass B 仅在缺失时用次年年报的上期补齐
     data: dict[int, dict[str, float]] = {}
-    for year, parsed in parsed_list:  # 已是倒序
+    # Pass A: 本期（正序即可，每个 PDF year 唯一对应一个本期年份）
+    for year, parsed in parsed_list:
+        for key, vals in parsed.items():
+            if len(vals) >= 1:
+                data.setdefault(year, {})[key] = vals[0]
+    # Pass B: 上期（仅在目标年份尚无数据时填充）
+    # 正序遍历（最旧年报优先），让离该年最近的年报的"上期"先入
+    for year, parsed in sorted(parsed_list, key=lambda x: x[0]):
         for key, vals in parsed.items():
             if len(vals) >= 2:
                 target_prev = data.setdefault(year - 1, {})
                 if key not in target_prev:
                     target_prev[key] = vals[1]
-            if len(vals) >= 1:
-                target_cur = data.setdefault(year, {})
-                if key not in target_cur:
-                    target_cur[key] = vals[0]
     return data
 
 
