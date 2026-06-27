@@ -700,7 +700,18 @@ def main():
     all_years = sorted(dataset.keys(), reverse=True)
 
     # 3) 范围过滤
-    years = all_years
+    # 关键: 只有「有自己的年报」的年份才能纳入分析。
+    # 原因: 算年份 N 的 ROE/Z 需要 N-1 末资产负债表做平均。
+    #   - 若 N 年报存在: N-1 末数据可从 N 年报的"上期"列取（完整可靠）
+    #   - 若 N 年报不存在: N 数据本身来自 N+1 年报的"上期"对照列，
+    #     而 N-1 末数据完全没有（既无 N 年报也无 N-1 年报），平均会退化为
+    #     单点期末值，导致总资产周转率/权益乘数/Z 值失真
+    pdf_years = set(y for y, _ in pdfs)  # 有独立年报的年份
+    excluded = sorted(set(all_years) - pdf_years, reverse=True)
+    if excluded:
+        print(f"ℹ️  排除 {len(excluded)} 个无独立年报的年份（仅作为上期对照）: "
+              f"{', '.join(map(str, excluded))}")
+    years = [y for y in all_years if y in pdf_years]
     if args.since:
         years = [y for y in years if y >= args.since]
     if args.latest:
