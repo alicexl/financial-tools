@@ -36,7 +36,7 @@ import requests
 SEARCH_URL = "http://www.cninfo.com.cn/new/information/topSearch/query"
 ANNOUNCE_URL = "http://www.cninfo.com.cn/new/hisAnnouncement/query"
 PDF_BASE = "http://static.cninfo.com.cn/"
-DEFAULT_OUTPUT_ROOT = r"D:\workspace\年报"
+DEFAULT_OUTPUT_ROOT = os.path.join(os.getcwd(), "年报")
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36")

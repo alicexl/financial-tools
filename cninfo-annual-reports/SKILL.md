@@ -27,7 +27,8 @@ description: Use when downloading annual reports, semi-annual reports, or quarte
 ## Quick Start
 
 ```bash
-# 默认下载全部年报到 D:\workspace\年报\<公司名>年报\
+# 默认下载全部年报到 <cwd>/年报/<公司名>年报/
+# (cwd = Claude Code 启动目录，由 os.getcwd() 决定)
 python C:/Users/Xulu/.claude/skills/cninfo-annual-reports/fetch_reports.py 盐湖股份
 
 # 全部定期报告（年报+半年报+一季+三季）

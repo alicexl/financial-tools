@@ -62,10 +62,11 @@ Both skills work together: the downloader produces PDFs in the layout the metric
    Both `cninfo-annual-reports` and `financial-metrics` should appear.
 
 4. **(Optional) Configure default paths**:
-   - `cninfo-annual-reports/fetch_reports.py`: edit `DEFAULT_OUTPUT_ROOT` (default: `D:\workspace\年报`)
+   - `cninfo-annual-reports/fetch_reports.py`: edit `DEFAULT_OUTPUT_ROOT` (default: `<cwd>/年报/`)
    - `financial-metrics/financial_metrics.py`: edit `DEFAULT_REPORTS_ROOT` (same default)
 
-   Both defaults match; if you change one, change the other to match.
+   Both default to `<current working directory when the script runs>/年报/`.
+   In Claude Code, cwd is the directory Claude was launched from. Change if you want a fixed location.
 
 ---
 
@@ -93,7 +94,7 @@ python ~/.claude/skills/cninfo-annual-reports/fetch_reports.py 盐湖股份 年�
 - Filters out summaries / English versions / cancelled announcements
 - Categories: 年报 / 半年报 / 一季报 / 三季报 / 全部
 
-**Output**: `D:\workspace\年报\<公司名>年报\<公司>_<年份>年年报.pdf`
+**Output**: `<cwd>/年报/<公司名>年报/<公司>_<年份>年年报.pdf`
 
 ---
 
@@ -119,7 +120,7 @@ python ~/.claude/skills/financial-metrics/financial_metrics.py 盐湖股份 --si
   - Z-Score: zone classification + X2 historical losses / X4 leverage / X5 asset turnover observations
 - **Markdown report**: `<公司>_财务分析.md` saved next to PDFs
 
-**Default data directory**: `D:\workspace\年报\<公司名>年报\` (matches the downloader's output)
+**Default data directory**: `<cwd>/年报/<公司名>年报/` (matches the downloader's output; cwd = Claude Code launch dir)
 
 ---
 

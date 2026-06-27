@@ -32,7 +32,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 import fitz  # PyMuPDF
 
-DEFAULT_REPORTS_ROOT = r"D:\workspace\年报"
+DEFAULT_REPORTS_ROOT = os.path.join(os.getcwd(), "年报")
 
 # 金额正则: 千分位逗号或带小数
 NUM = r"-?\d{1,3}(?:,\d{3})+(?:\.\d+)?|-?\d+\.\d{2,}"
