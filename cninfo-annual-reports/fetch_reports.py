@@ -66,7 +66,7 @@ CATEGORY_MAP = {
 ALL_TYPES = ["年报", "半年报", "一季报", "三季报"]
 
 # 公告标题中需要排除的干扰词
-EXCLUDE_KEYWORDS = ["摘要", "英文版", "已取消", "更正", "补充", "修订", "更新后", "第二次", "第一次"]
+EXCLUDE_KEYWORDS = ["摘要", "英文", "已取消", "更正", "补充", "修订", "更新后", "第二次", "第一次"]
 
 
 def guess_column(stock_code: str) -> str:

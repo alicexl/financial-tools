@@ -252,13 +252,23 @@ def _detect_unit_scale(doc) -> float:
 
     # 优先级 2: 报表页头单位标注
     # 兼容多种写法: "单位：元" / "单位:人民币千元" / "金额单位为人民币千元" / "（金额单位：人民币元）"
+    # 必须同时满足：(a) 含报表段标记 (b) 含报表行项 (c) 数值密度高（真报表页有几十个数字单元格）
+    # 避免审计/薪酬/股权激励等章节也提到"合并资产负债表"导致误判
+    # （海尔智家 p93 审计师费用表 + p93 会计政策叙述都误中过）
+    statement_markers = ("合并资产负债表", "合并利润表",
+                         "合并及公司资产负债表", "合并及公司利润表")
+    line_item_hints = ("营业收入", "营业总收入", "资产总计", "营业成本")
     for i in range(doc.page_count):
         t = doc[i].get_text()
-        if any(m in t for m in ("合并资产负债表", "合并利润表",
-                                  "合并及公司资产负债表", "合并及公司利润表")):
-            m = re.search(r"单位[^元千百万]{0,8}(?:人民币)?\s*(元|千元|百元|万元|亿元)", t)
-            if m:
-                return _UNIT_SCALES[m.group(1)]
+        if not any(m in t for m in statement_markers):
+            continue
+        if not any(h in t for h in line_item_hints):
+            continue
+        if len(re.findall(r"\d[\d,]{3,}", t)) < 15:  # 真报表页至少 15 个 4 位以上数字
+            continue
+        m = re.search(r"单位[^元千百万]{0,8}(?:人民币)?\s*(元|千元|百元|万元|亿元)", t)
+        if m:
+            return _UNIT_SCALES[m.group(1)]
 
     # 优先级 3: 数值幅度启发式
     # 找合并资产负债表页，取「资产总计」值判断单位
@@ -377,12 +387,14 @@ def build_yearly_dataset(pdfs: list[tuple[int, str]]) -> dict[int, dict[str, flo
             continue
         v_min, v_max = min(vals), max(vals)
         ratio = v_max / v_min
-        # 990~1010 容忍 1% 浮点误差
-        if 990 < ratio < 1010:
-            # 较小值的源 PDF 需要乘 1000
-            for src_year, v in entries:
-                if v == v_min:
-                    corrections[src_year] = max(corrections.get(src_year, 1.0), 1000.0)
+        # 容忍 1% 浮点误差。同时支持 1000x（千元未识别）和 10000x（万元未识别）
+        # 两种典型单位误识别场景
+        for scale, lo, hi in ((1000.0, 990, 1010), (10000.0, 9900, 10100)):
+            if lo < ratio < hi:
+                for src_year, v in entries:
+                    if v == v_min:
+                        corrections[src_year] = max(corrections.get(src_year, 1.0), scale)
+                break  # 同一字段一次只匹配一种 scale
 
     # 应用修正
     if corrections:
