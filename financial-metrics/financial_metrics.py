@@ -101,14 +101,18 @@ def _extract_value(text: str, label_pattern: str, count: int = 2) -> list[float]
     在 text 中找 label_pattern 后紧跟的 count 个金额数字。
     label_pattern 是已编译的正则字符串（可含 lookbehind）。
     label 后允许 0~80 字符的非数字干扰（如单位标注、换行、空格）。
+
+    分隔符 (SEP) 用 (?:[^\\d-]|-(?!\\d)):
+      - 排除数字 (避免吞掉金额/附注号)
+      - 排除"减号+数字"组合 (保留负数识别 -123.45)
+      - 允许字面 "-" (如标签后缀 "（净亏损以\\"-\\"号填列）")
     """
     flat = _flatten(text)
-    # label 后允许: 非数字字符 + 可选附注号(1-3位数字+非数字分隔) + 非数字字符 + NUM
-    # 例: "未分配利润 39 182,787,415,205.05" 中 "39" 是附注号
+    SEP = r"(?:[^\d-]|-(?!\d))"
     pat = re.compile(
         label_pattern
-        + r"[^\d-]{0,30}?(?:\d{1,3}[^\d-]{1,15})?[^\d-]{0,15}?"
-        + (r"(" + NUM + r")" + r"[^\d-]{0,15}?") * count
+        + SEP + r"{0,40}?(?:\d{1,3}" + SEP + r"{1,20})?" + SEP + r"{0,20}?"
+        + (r"(" + NUM + r")" + SEP + r"{0,20}?") * count
     )
     m = pat.search(flat)
     if not m:
@@ -126,19 +130,29 @@ def parse_pdf(pdf_path: str) -> dict[str, list[float]]:
       2. 只在对应报表的页文本里搜索科目，避免正文中"利润总额"等词的干扰
       3. 归母口径标签缺失时，fallback 到 "净利润" / "所有者权益合计"
          （适用于无少数股东权益的单一主体公司，如芭田股份）
+      4. 检测报表单位（元/千元/万元），归一化到元
     """
     doc = fitz.open(pdf_path)
 
+    # 检测单位标度（归一化到元）
+    unit_scale = _detect_unit_scale(doc)
+
     # 找合并利润表和合并资产负债表的页范围
+    # content_hints 防止审计报告/正文中提及"合并利润表"被误判为报表起点
+    # 注意: 营业收入/营业收入这种通用词在审计报告叙述里也会出现，
+    # 必须用报表专用词（营业总收入/营业总成本/所得税费用/利润总额的组合）
     income_pages = _find_section_pages(
         doc,
-        start_marker="合并利润表",
-        stop_markers=["母公司利润表", "合并现金流量表", "合并所有者权益变动表"],
+        start_marker=["合并利润表", "合并及公司利润表"],
+        stop_markers=["母公司利润表", "合并现金流量表", "合并所有者权益变动表",
+                      "合并及公司现金流量表", "合并及公司所有者权益变动表"],
+        content_hints=["营业收入", "营业总收入", "营业总成本"],
     )
     balance_pages = _find_section_pages(
         doc,
-        start_marker="合并资产负债表",
-        stop_markers=["母公司资产负债表", "合并利润表"],
+        start_marker=["合并资产负债表", "合并及公司资产负债表"],
+        stop_markers=["母公司资产负债表", "合并利润表", "合并及公司利润表"],
+        content_hints=["资产总计", "流动资产合计", "负债合计"],
     )
 
     income_text = "\n".join(doc[i].get_text() for i in income_pages) if income_pages else ""
@@ -164,8 +178,12 @@ def parse_pdf(pdf_path: str) -> dict[str, list[float]]:
     out['profit_before_tax'] = extract_with_fallback(income_text, [_flexible_label("利润总额")])
     out['income_tax']        = extract_with_fallback(income_text, [_flexible_label("所得税费用")])
     # 优先 "归属于母公司股东的净利润"; 失败则 fallback "净利润（净亏损" (单一主体公司)
+    # 含完整括号后缀的优先（避免 _extract_value 分隔符在 ")" 后立刻匹配失败）
     out['net_profit_parent'] = extract_with_fallback(income_text, [
+        _flexible_label('归属于母公司股东的净利润（净亏损以"-"号填列）'),
+        _flexible_label('归属于母公司所有者的净利润（净亏损以"-"号填列）'),
         _flexible_label("归属于母公司股东的净利润"),
+        _flexible_label("归属于母公司所有者的净利润"),
         _flexible_label("净利润（净亏损"),
         r"净利润\(净亏损",
     ])
@@ -178,35 +196,137 @@ def parse_pdf(pdf_path: str) -> dict[str, list[float]]:
     ])
     out['undistributed_profit'] = extract_with_fallback(balance_text, [_flexible_label("未分配利润")])
     out['surplus_reserve']     = extract_with_fallback(balance_text, [_flexible_label("盈余公积")])
-    # equity_parent: 三种格式 fallback (都用 flexible 以兼容跨行拆标签)
+    # equity_parent: 多种格式 fallback (都用 flexible 以兼容跨行拆标签)
+    #   - 归属于母公司所有者权益合计 (最标准)
+    #   - 归属于母公司所有者权益（或股东权益）合计 (茅台)
+    #   - 归属于母公司股东权益合计 (格力/家电系，无"所有者")
+    #   - 所有者权益（或股东权益）合计 (单一主体 fallback)
+    #   - (?<![司]) 所有者权益合计 (兜底，排除"归属于母公司所有者权益合计")
     out['equity_parent'] = extract_with_fallback(balance_text, [
         _flexible_label("归属于母公司所有者权益合计"),
         _flexible_label("归属于母公司所有者权益（或股东权益）合计"),
+        _flexible_label("归属于母公司股东权益合计"),
+        _flexible_label("归属于母公司股东权益（或股东权益）合计"),
         _flexible_label("所有者权益（或股东权益）合计"),
         r"(?<![司])" + _flexible_label("所有者权益合计"),
     ])
     out['total_equity'] = extract_with_fallback(balance_text, [
         _flexible_label("所有者权益（或股东权益）合计"),
+        r"(?<![司])" + _flexible_label("股东权益合计"),  # 格力等用"股东权益"术语
         r"(?<![司])" + _flexible_label("所有者权益合计"),
     ])
     out['total_assets']  = extract_with_fallback(balance_text, [_flexible_label("资产总计")])
     out['share_capital'] = extract_with_fallback(balance_text, [_flexible_label("股本")])
+
+    # 应用单位标度（千元/万元 → 元）
+    if unit_scale != 1.0:
+        for k, vals in out.items():
+            out[k] = [v * unit_scale for v in vals]
     return out
 
 
-def _find_section_pages(doc, start_marker: str, stop_markers: list[str],
-                       max_pages: int = 6) -> list[int]:
+# 单位 → 元 的乘数
+_UNIT_SCALES = {"元": 1.0, "百元": 1e2, "千元": 1e3, "万元": 1e4, "亿元": 1e8}
+
+
+def _detect_unit_scale(doc) -> float:
+    """
+    检测年报财务报表的金额单位，返回乘到「元」的系数。
+    默认 1.0（元）。
+
+    检测优先级：
+      1. 财务附注全局声明「财务附注中报表的单位为：X」（如比亚迪用千元）
+      2. 报表页头的「单位：人民币X」标注（绝大多数 PDF 用元）
+      3. 数值幅度启发式（无任何声明时，按典型 A 股公司规模反推单位）
+         - A 股最小上市公司资产总计也在 10^8 元（1 亿）以上
+         - 若资产总计 < 10^5 → 单位是万元（10^4 系数）
+         - 若资产总计 in [10^5, 10^8) → 单位是千元（10^3 系数）
+         - 若资产总计 ≥ 10^8 → 单位是元
+    """
+    # 优先级 1: 全局声明
+    for i in range(min(doc.page_count, 200)):
+        t = doc[i].get_text()
+        m = re.search(r"财务附注中报表的单位为[：:]\s*(元|千元|百元|万元|亿元)", t)
+        if m:
+            return _UNIT_SCALES[m.group(1)]
+
+    # 优先级 2: 报表页头单位标注
+    # 兼容多种写法: "单位：元" / "单位:人民币千元" / "金额单位为人民币千元" / "（金额单位：人民币元）"
+    for i in range(doc.page_count):
+        t = doc[i].get_text()
+        if any(m in t for m in ("合并资产负债表", "合并利润表",
+                                  "合并及公司资产负债表", "合并及公司利润表")):
+            m = re.search(r"单位[^元千百万]{0,8}(?:人民币)?\s*(元|千元|百元|万元|亿元)", t)
+            if m:
+                return _UNIT_SCALES[m.group(1)]
+
+    # 优先级 3: 数值幅度启发式
+    # 找合并资产负债表页，取「资产总计」值判断单位
+    for i in range(doc.page_count):
+        t = doc[i].get_text()
+        if not any(m in t for m in ("合并资产负债表", "合并及公司资产负债表")) \
+                or "资产总计" not in t:
+            continue
+        vals = _extract_value(t, _flexible_label("资产总计"), count=1)
+        if not vals:
+            continue
+        ta = vals[0]
+        # A 股最小上市公司资产 ~10^8 元（1 亿元）
+        if ta < 1e5:
+            return _UNIT_SCALES["万元"]
+        if ta < 1e8:
+            return _UNIT_SCALES["千元"]
+        return _UNIT_SCALES["元"]
+
+    return 1.0
+
+
+def _find_section_pages(doc, start_marker, stop_markers: list[str],
+                       max_pages: int = 6, content_hints: list[str] | None = None,
+                       min_numeric_density: int = 15) -> list[int]:
     """
     定位从 start_marker 开始、到任一 stop_marker 之前的页范围。
+    - start_marker 可以是 str 或 list[str]（任一匹配即视为起点，用于兼容
+      "合并利润表" vs "合并及公司利润表" 这类异构标签）
     - stop_marker 在某页出现时，该页**仍包含**（因为 stop 之前的内容属于当前 section）
     - 但不再向下扩展
     - max_pages 上限防止误吞过多页（默认 6，覆盖跨 5 页的大表）
+    - content_hints: 可选，要求 start 页同时包含这些关键词之一
+      （避免审计报告/正文中提及"合并利润表"被误判为报表起点；
+      利润表 hints=["营业总收入","营业收入"], 资产负债表 hints=["资产总计","流动资产"])
+    - min_numeric_density: start 页需至少含此数量的「4 位以上数字串」。
+      真报表页有几十/上百个数字单元格；审计/正文叙述页一般 < 15。
+      设为 0 可禁用此启发式。
     """
+    if isinstance(start_marker, str):
+        markers = [start_marker]
+    else:
+        markers = list(start_marker)
+
+    def _has_any_marker(text: str) -> bool:
+        return any(m in text for m in markers)
+
+    def _numeric_density(text: str) -> int:
+        # 4 位及以上的数字串个数（含千分位逗号）。真报表页通常 > 30；叙述页 < 15。
+        return len(re.findall(r"\d[\d,]{3,}", text))
+
     start = None
     for i in range(doc.page_count):
-        if start_marker in doc[i].get_text():
-            start = i
-            break
+        t = doc[i].get_text()
+        if not _has_any_marker(t):
+            continue
+        if content_hints and not any(h in t for h in content_hints):
+            continue
+        if min_numeric_density > 0 and _numeric_density(t) < min_numeric_density:
+            continue
+        start = i
+        break
+    if start is None:
+        # 退化: 不要求 content_hints / 数值密度
+        for i in range(doc.page_count):
+            if _has_any_marker(doc[i].get_text()):
+                start = i
+                break
     if start is None:
         return []
 
@@ -214,7 +334,6 @@ def _find_section_pages(doc, start_marker: str, stop_markers: list[str],
     for i in range(start + 1, min(start + max_pages, doc.page_count)):
         t = doc[i].get_text()
         if any(m in t for m in stop_markers):
-            # 当前页可能仍含当前 section 的尾部数据，仍包含
             pages.append(i)
             break
         pages.append(i)
@@ -227,23 +346,66 @@ def build_yearly_dataset(pdfs: list[tuple[int, str]]) -> dict[int, dict[str, flo
     每份年报 N 提供 (本期=year=N, 上期=year=N-1) 两份数据。
     合并规则: 每个年份的数据来自「包含该年份的最新年报」——
     即从最新年报开始倒序遍历，仅在该年份尚未有数据时填入。
-    """
-    data: dict[int, dict[str, float]] = {}
 
-    for year, path in pdfs:  # 已是倒序
-        parsed = parse_pdf(path)
+    跨 PDF 单位一致性: 若同一年的数据在不同 PDF 里差 1000 倍，
+    说明其中一份的单位未识别（默认按元处理但实际是千元），自动补正。
+    """
+    # Phase 1: 各 PDF 独立解析
+    parsed_list: list[tuple[int, dict[str, list[float]]]] = [
+        (year, parse_pdf(path)) for year, path in pdfs
+    ]
+
+    # Phase 2: 跨 PDF 单位一致性检查
+    # 收集 (年, 字段) → [(源 PDF 年, 值), ...]
+    field_values: dict[tuple[int, str], list[tuple[int, float]]] = {}
+    for src_year, parsed in parsed_list:
+        for key, vals in parsed.items():
+            if len(vals) >= 1:
+                field_values.setdefault((src_year, key), []).append((src_year, vals[0]))
+            if len(vals) >= 2:
+                field_values.setdefault((src_year - 1, key), []).append((src_year, vals[1]))
+
+    # 检测同 (年, 字段) 是否有 1000 倍差异
+    corrections: dict[int, float] = {}  # src_pdf_year → multiplier
+    for (yr, key), entries in field_values.items():
+        if key not in ("total_assets", "revenue"):  # 用这两个稳定字段判定
+            continue
+        if len(entries) < 2:
+            continue
+        vals = [v for _, v in entries if v > 0]
+        if len(vals) < 2:
+            continue
+        v_min, v_max = min(vals), max(vals)
+        ratio = v_max / v_min
+        # 990~1010 容忍 1% 浮点误差
+        if 990 < ratio < 1010:
+            # 较小值的源 PDF 需要乘 1000
+            for src_year, v in entries:
+                if v == v_min:
+                    corrections[src_year] = max(corrections.get(src_year, 1.0), 1000.0)
+
+    # 应用修正
+    if corrections:
+        new_parsed_list = []
+        for src_year, parsed in parsed_list:
+            m = corrections.get(src_year, 1.0)
+            if m != 1.0:
+                parsed = {k: [v * m for v in vals] for k, vals in parsed.items()}
+            new_parsed_list.append((src_year, parsed))
+        parsed_list = new_parsed_list
+
+    # Phase 3: 多年合并（倒序，最新优先）
+    data: dict[int, dict[str, float]] = {}
+    for year, parsed in parsed_list:  # 已是倒序
         for key, vals in parsed.items():
             if len(vals) >= 2:
-                # 上期数据填到 year-1（最新视角，优先）
                 target_prev = data.setdefault(year - 1, {})
                 if key not in target_prev:
                     target_prev[key] = vals[1]
             if len(vals) >= 1:
-                # 本期数据填到 year
                 target_cur = data.setdefault(year, {})
                 if key not in target_cur:
                     target_cur[key] = vals[0]
-
     return data
 
 
@@ -343,10 +505,12 @@ def compute_metrics(year: int, cur: dict[str, float], prev: dict[str, float] | N
         X4 = (total_equity_cur / total_liab) if (total_equity_cur and total_liab) else None
         X5 = (revenue / total_assets_cur) if revenue else None
 
+        # 即使个别 X 缺失也存表（终端能展示部分 X 值）
+        m['z_X1'], m['z_X2'], m['z_X3'], m['z_X4'], m['z_X5'] = X1, X2, X3, X4, X5
+        # 仅当全部 X 都在时才合成总分
         if all(v is not None for v in [X1, X2, X3, X4, X5]):
             m['z_score'] = 1.2 * X1 + 1.4 * X2 + 3.3 * X3 + 0.6 * X4 + 1.0 * X5
             m['z_prime'] = 0.717 * X1 + 0.847 * X2 + 3.107 * X3 + 0.420 * X4
-            m['z_X1'], m['z_X2'], m['z_X3'], m['z_X4'], m['z_X5'] = X1, X2, X3, X4, X5
 
     return m
 
