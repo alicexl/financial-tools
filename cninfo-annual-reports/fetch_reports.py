@@ -22,7 +22,22 @@ import os
 import re
 import sys
 import time
+import unicodedata
 from datetime import datetime
+
+
+def normalize_company_name(name: str) -> str:
+    """
+    规范化公司名用于目录/文件名：
+    - 全角拉丁字母/数字 → 半角 (NFKC)
+      京东方Ａ → 京东方A
+      ＣＳＣ → CSC
+    避免下游 skill (financial-metrics) 因大小/全半角差异匹配目录失败。
+    中文标点（：、（）等）保留不变。
+    """
+    if not name:
+        return name
+    return unicodedata.normalize("NFKC", name)
 from typing import Iterable
 
 # Windows GBK 终端兼容: 强制 stdout 用 UTF-8
@@ -257,7 +272,7 @@ def main():
     company_info = resolve_company(args.company)
     stock_code = company_info["code"]
     org_id = company_info["orgId"]
-    company_name = company_info["zwjc"]
+    company_name = normalize_company_name(company_info["zwjc"])
     print(f"✅ {company_name} ({stock_code}), orgId={org_id}")
 
     # 2) 决定要下载哪些类型
