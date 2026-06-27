@@ -34,8 +34,10 @@ import fitz  # PyMuPDF
 
 DEFAULT_REPORTS_ROOT = os.path.join(os.getcwd(), "年报")
 
-# 金额正则: 千分位逗号或带小数
-NUM = r"-?\d{1,3}(?:,\d{3})+(?:\.\d+)?|-?\d+\.\d{2,}"
+# 金额正则: 千分位逗号（小数恰好 2 位，财务数据规范）或纯小数
+# 限定小数 2 位是为了防止 _flatten 去空白后两个相邻数字被吞并：
+#   "174,144,069,958.25150,560,330,316.45" 中，贪婪 \.\d+ 会把 "25150" 当作小数
+NUM = r"-?\d{1,3}(?:,\d{3})+(?:\.\d{2})?|-?\d+\.\d{2}"
 
 
 # ===== Step 1: 定位公司年报 PDF =====
@@ -75,8 +77,23 @@ def find_pdfs(company_or_dir: str) -> tuple[str, list[tuple[int, str]]]:
 
 # ===== Step 2: PDF 解析 =====
 def _flatten(text: str) -> str:
-    """合并空白便于正则匹配。"""
+    """合并所有空白为单空格，便于正则匹配。"""
     return re.sub(r"\s+", " ", text)
+
+
+def _flexible_label(label: str) -> str:
+    """
+    在标签每个非空白字符之间插入 \\s* ，允许 PDF 把标签任意拆行。
+
+    例: PDF 把 "所有者权益（或股东权益）合计" 拆为
+        "所有者权益（或股东权\\n益）合计"
+    flatten 后变成 "所有者权益（或股东权 益）合计"（含空格）。
+    \\s* 让正则在每个字符之间容忍空格，匹配跨行标签。
+
+    已含正则元字符（如 lookbehind (?<![动])）的 pattern 不应使用此函数。
+    """
+    chars = [c for c in label if not c.isspace()]
+    return r"\s*".join(re.escape(c) for c in chars)
 
 
 def _extract_value(text: str, label_pattern: str, count: int = 2) -> list[float]:
@@ -86,8 +103,12 @@ def _extract_value(text: str, label_pattern: str, count: int = 2) -> list[float]
     label 后允许 0~80 字符的非数字干扰（如单位标注、换行、空格）。
     """
     flat = _flatten(text)
+    # label 后允许: 非数字字符 + 可选附注号(1-3位数字+非数字分隔) + 非数字字符 + NUM
+    # 例: "未分配利润 39 182,787,415,205.05" 中 "39" 是附注号
     pat = re.compile(
-        label_pattern + r"[^\d-]{0,80}?" + (r"(" + NUM + r")" + r"[^\d-]{0,30}?") * count
+        label_pattern
+        + r"[^\d-]{0,30}?(?:\d{1,3}[^\d-]{1,15})?[^\d-]{0,15}?"
+        + (r"(" + NUM + r")" + r"[^\d-]{0,15}?") * count
     )
     m = pat.search(flat)
     if not m:
@@ -134,33 +155,42 @@ def parse_pdf(pdf_path: str) -> dict[str, list[float]]:
 
     # 利润表科目
     out: dict[str, list[float]] = {}
-    out['revenue']           = extract_with_fallback(income_text, [r"营业收入"])
-    out['interest_expense']  = extract_with_fallback(income_text, [r"利息费用"])
-    out['profit_before_tax'] = extract_with_fallback(income_text, [r"利润总额"])
-    out['income_tax']        = extract_with_fallback(income_text, [r"所得税费用"])
+    # revenue: 优先 "营业总收入"（集团含金融业务，如茅台），fallback "营业收入"
+    out['revenue']           = extract_with_fallback(income_text, [
+        _flexible_label("营业总收入"),
+        _flexible_label("营业收入"),
+    ])
+    out['interest_expense']  = extract_with_fallback(income_text, [_flexible_label("利息费用")])
+    out['profit_before_tax'] = extract_with_fallback(income_text, [_flexible_label("利润总额")])
+    out['income_tax']        = extract_with_fallback(income_text, [_flexible_label("所得税费用")])
     # 优先 "归属于母公司股东的净利润"; 失败则 fallback "净利润（净亏损" (单一主体公司)
     out['net_profit_parent'] = extract_with_fallback(income_text, [
-        r"归属于母公司股东的净利润",
-        r"净利润（净亏损",
+        _flexible_label("归属于母公司股东的净利润"),
+        _flexible_label("净利润（净亏损"),
         r"净利润\(净亏损",
     ])
     # 资产负债表科目
-    out['current_assets']      = extract_with_fallback(balance_text, [r"流动资产合计"])
-    out['current_liabilities'] = extract_with_fallback(balance_text, [r"流动负债合计"])
-    out['total_liabilities']   = extract_with_fallback(balance_text, [r"(?<![动])负债合计"])
-    out['undistributed_profit'] = extract_with_fallback(balance_text, [r"未分配利润"])
-    out['surplus_reserve']     = extract_with_fallback(balance_text, [r"盈余公积"])
-    # 优先 "归属于母公司所有者权益合计"; 失败则 fallback "所有者权益合计" (单一主体)
+    out['current_assets']      = extract_with_fallback(balance_text, [_flexible_label("流动资产合计")])
+    out['current_liabilities'] = extract_with_fallback(balance_text, [_flexible_label("流动负债合计")])
+    # lookbehind 不通过 _flexible_label，但主体标签可以
+    out['total_liabilities']   = extract_with_fallback(balance_text, [
+        r"(?<![动])" + _flexible_label("负债合计"),
+    ])
+    out['undistributed_profit'] = extract_with_fallback(balance_text, [_flexible_label("未分配利润")])
+    out['surplus_reserve']     = extract_with_fallback(balance_text, [_flexible_label("盈余公积")])
+    # equity_parent: 三种格式 fallback (都用 flexible 以兼容跨行拆标签)
     out['equity_parent'] = extract_with_fallback(balance_text, [
-        r"归属于母公司所有者权益合计",
-        r"(?<![司])所有者权益合计",
+        _flexible_label("归属于母公司所有者权益合计"),
+        _flexible_label("归属于母公司所有者权益（或股东权益）合计"),
+        _flexible_label("所有者权益（或股东权益）合计"),
+        r"(?<![司])" + _flexible_label("所有者权益合计"),
     ])
-    # 总权益口径: 有少数股东时用 "所有者权益合计" 排除归母标签，无少数股东时与 equity_parent 相同
     out['total_equity'] = extract_with_fallback(balance_text, [
-        r"(?<![司])所有者权益合计",
+        _flexible_label("所有者权益（或股东权益）合计"),
+        r"(?<![司])" + _flexible_label("所有者权益合计"),
     ])
-    out['total_assets']  = extract_with_fallback(balance_text, [r"资产总计"])
-    out['share_capital'] = extract_with_fallback(balance_text, [r"股本"])
+    out['total_assets']  = extract_with_fallback(balance_text, [_flexible_label("资产总计")])
+    out['share_capital'] = extract_with_fallback(balance_text, [_flexible_label("股本")])
     return out
 
 
