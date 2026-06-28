@@ -167,6 +167,8 @@ def parse_pdf(pdf_path: str) -> dict[str, list[float]]:
                        "负债合计", "所有者权益合计"],
         # 合并报表独有"归属于母公司"或"少数股东权益"
         strong_hints=["归属于母公司", "少数股东权益"],
+        # 资产负债表可跨 3-4 页，strong_hints 常在后段才出现 → 用 3 页窗口
+        strong_hint_window=3,
     )
 
     income_text = "\n".join(doc[i].get_text() for i in income_pages) if income_pages else ""
@@ -332,7 +334,8 @@ def _find_section_pages(doc, start_marker, stop_markers: list[str],
                        max_pages: int = 6, content_hints: list[str] | None = None,
                        min_numeric_density: int = 15,
                        min_hits_tier2: int = 3,
-                       strong_hints: list[str] | None = None) -> list[int]:
+                       strong_hints: list[str] | None = None,
+                       strong_hint_window: int = 2) -> list[int]:
     """
     定位从 start_marker 开始、到任一 stop_marker 之前的页范围。
     - start_marker 可以是 str 或 list[str]（任一匹配即视为起点，用于兼容
@@ -378,22 +381,36 @@ def _find_section_pages(doc, start_marker, stop_markers: list[str],
         return any(h in text for h in strong_hints)
 
     page_texts = [doc[i].get_text() for i in range(doc.page_count)]
-    summary_markers = ("主要会计数据", "主要财务指标", "加权平均净资产收益率",
-                        "每股收益")
+    # hard_summary: MD&A 章节标题，绝不出现在真合并报表里 → 始终排除
+    # soft_summary: 报表行项（每股收益/加权平均ROE），真报表也会有；仅当 hint 低时排除
+    hard_summary = ("主要会计数据", "主要财务指标", "分季度主要财务指标")
+    soft_summary = ("加权平均净资产收益率", "每股收益")
 
     # Tier 1: 有 marker + 至少 2 个 content_hints + 高密度
     # （之前的 "marker + any hint" 太松：福耀玻璃 p14 MD&A 叙述提到"合并利润表"
     # 加 1 个"营业收入"词就过门槛；改为 2+ hints 可靠区分真报表 vs MD&A 叙述）
+    # summary 排除分两档:
+    #   - hard_summary（"主要会计数据"章节标题）→ 一票否决
+    #   - soft_summary（"每股收益"/"加权平均净资产收益率"行项）→ 真报表也会含，
+    #     仅当 hint < 4 时排除（避免 MD&A 摘要页混入）
+    def _is_summary_page(text: str, hc: int) -> bool:
+        if any(m in text for m in hard_summary):
+            return True
+        if hc < 4 and any(m in text for m in soft_summary):
+            return True
+        return False
+
     start = None
     for i in range(doc.page_count):
         t = page_texts[i]
         if not _has_any_marker(t):
             continue
-        if any(m in t for m in summary_markers):
+        hc = _hint_count(t)
+        if _is_summary_page(t, hc):
             continue
         if min_numeric_density > 0 and _numeric_density(t) < min_numeric_density:
             continue
-        if content_hints and _hint_count(t) < 2:
+        if content_hints and hc < 2:
             continue
         start = i
         break
@@ -405,15 +422,17 @@ def _find_section_pages(doc, start_marker, stop_markers: list[str],
         weak_candidates: list[tuple[int, int]] = []
         for i in range(doc.page_count):
             t = page_texts[i]
-            if any(m in t for m in summary_markers):
+            hc = _hint_count(t)
+            if _is_summary_page(t, hc):
                 continue
             if min_numeric_density > 0 and _numeric_density(t) < min_numeric_density:
                 continue
-            hc = _hint_count(t)
-            # lookahead 窗口: 当前页 + 后续 1 页（资产负债表跨页通常 2 页内）
-            # 不用 max_pages 是避免窗口过宽泄漏到下一个报表（如合并资产负债表
-            # 之后的合并利润表也含"归属于母公司股东的净利润"，会误判）
-            window_end = min(i + 2, doc.page_count)
+            # lookahead 窗口: 当前页 + 后续 (strong_hint_window - 1) 页
+            # - 利润表 window=2（current+1）: 跨 2 页足够；过宽会泄漏到合并资产负债表
+            #   误判（资产负债表也含"归属于母公司股东的净利润"）
+            # - 资产负债表 window=3（current+2）: 大型集团资产负债表可跨 3-4 页，
+            #   "归属于母公司"/"少数股东权益"常在后段才出现
+            window_end = min(i + strong_hint_window, doc.page_count)
             window_text = "\n".join(page_texts[i:window_end])
             has_strong_in_window = _has_strong(window_text)
             # 候选资格:
@@ -442,12 +461,15 @@ def _find_section_pages(doc, start_marker, stop_markers: list[str],
                     start = idx
 
     if start is None:
-        # Tier 3: marker only（最终兜底）
+        # Tier 3: marker only（最终兜底）— 仍排除 MD&A 主要会计数据页
         for i in range(doc.page_count):
-            if _has_any_marker(page_texts[i]):
-                start = i
-                break
-                break
+            t = page_texts[i]
+            if not _has_any_marker(t):
+                continue
+            if _is_summary_page(t, _hint_count(t)):
+                continue
+            start = i
+            break
     if start is None:
         return []
 

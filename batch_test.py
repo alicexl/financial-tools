@@ -11,7 +11,9 @@ BASE = "D:/workspace/年报"
 
 def run_one(company_dir: str) -> dict:
     d = company_dir
-    pdfs = sorted(f for f in os.listdir(d) if f.endswith(".pdf") and "年报" in f)
+    pdfs = sorted(f for f in os.listdir(d)
+                  if f.lower().endswith(".pdf") and re.search(r"\d{4}年", f)
+                  and not any(kw in f for kw in ["摘要", "英文版", "已取消", "更正"]))
     if not pdfs:
         return {"status": "NO_PDF"}
     # 最近 3 份年报
@@ -34,11 +36,11 @@ def run_one(company_dir: str) -> dict:
         npp = d_last.get("net_profit_parent") or 0
         ta = d_last.get("total_assets") or 0
         eq = d_last.get("equity_parent") or 0
-        # 简单合理性: 营收应在 1亿 - 10万亿之间
+        # 简单合理性: 营收应在 1亿 - 10万亿之间；净利润可负（真实亏损）
         flags = []
         if not (1e8 <= rev <= 1e13):
             flags.append(f"rev_suspicious({rev/1e8:.2f}亿)")
-        if not (1e7 <= npp <= 1e12):
+        if not (-1e12 <= npp <= 1e12):
             flags.append(f"npp_suspicious({npp/1e8:.2f}亿)")
         if not (1e8 <= ta <= 1e13):
             flags.append(f"ta_suspicious({ta/1e8:.2f}亿)")
