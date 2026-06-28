@@ -719,7 +719,8 @@ def print_terminal_table(company: str, years: list[int], metrics: dict[int, dict
 
 # ===== Step 6: Markdown 报告 =====
 def write_markdown(company: str, years: list[int], metrics: dict[int, dict],
-                   out_path: str, trend_lines: list[str] | None = None) -> None:
+                   out_path: str, trend_lines: list[str] | None = None,
+                   risk_lines: list[str] | None = None) -> None:
     lines = [
         f"# {company} 财务指标分析",
         f"",
@@ -798,6 +799,15 @@ def write_markdown(company: str, years: list[int], metrics: dict[int, dict],
         lines.append("## 五、趋势分析")
         lines.append("")
         lines.extend(trend_lines)
+        lines.append("")
+
+    # 追加排雷分析章节
+    if risk_lines:
+        lines.append("## 六、排雷分析（风险预警）")
+        lines.append("")
+        lines.append("基于 Z-score 各分量 + 杜邦因子的逐项检查（绝对水平 + 趋势方向）：")
+        lines.append("")
+        lines.extend(risk_lines)
         lines.append("")
 
     with open(out_path, "w", encoding="utf-8") as f:
@@ -1023,6 +1033,189 @@ def generate_trend_analysis(years: list[int], metrics: dict[int, dict]) -> list[
     return lines
 
 
+# ===== Step 7b: 排雷分析 (风险预警) =====
+def generate_risk_warnings(years: list[int], metrics: dict[int, dict]) -> list[str]:
+    """
+    排雷分析: 从 Z-score 各分量 + 杜邦因子，列出触发的风险信号。
+
+    每条信号检查「绝对水平」+「趋势方向」两个维度。返回 list[str] (markdown 段落)。
+    信号分级: 🚨 高度警示 / ⚠️ 关注信号 / ✅ 无明显风险。
+    """
+    if not years:
+        return []
+    first_y, last_y = years[0], years[-1]
+    first, last = metrics[first_y], metrics[last_y]
+
+    red_flags: list[str] = []     # 🚨 致命信号
+    yellow_flags: list[str] = []  # ⚠️ 关注点
+
+    def _series(key):
+        return [(y, metrics[y].get(key)) for y in years]
+
+    def _monotonic_dec(key):
+        s = [v for _, v in _series(key) if v is not None]
+        return len(s) >= 3 and all(s[i + 1] < s[i] for i in range(len(s) - 1))
+
+    def _rel_delta(key):
+        """返回 (v_first, v_last, rel_change)；v_first 为 0/None 时返回 None。"""
+        v1, v2 = first.get(key), last.get(key)
+        if v1 is None or v2 is None or v1 == 0:
+            return None
+        return v1, v2, (v2 - v1) / abs(v1)
+
+    # ===== 1. Z-score 区间 + 连续下行 =====
+    z_last = last.get('z_score')
+    if z_last is not None:
+        if z_last < 1.81:
+            red_flags.append(
+                f"Z 值 {z_last:.2f} 已落入**高风险区** (Z < 1.81)，破产概率显著"
+            )
+        elif z_last < 2.99:
+            yellow_flags.append(
+                f"Z 值 {z_last:.2f} 处于**灰色区** (1.81–2.99)，需持续关注"
+            )
+    if _monotonic_dec('z_score'):
+        zs = [v for _, v in _series('z_score') if v is not None]
+        yellow_flags.append(
+            f"Z 值在 {first_y}–{last_y} 期间**连续下行** "
+            f"({zs[0]:.2f} → {zs[-1]:.2f})，财务健康度逐年恶化"
+        )
+
+    # ===== 2. X1 营运资本/总资产 (短期流动性) =====
+    x1_last = last.get('z_X1')
+    if x1_last is not None:
+        if x1_last < 0:
+            red_flags.append(
+                f"X1 营运资本/总资产 = {x1_last:.3f} (**为负**)："
+                f"流动负债 > 流动资产，短期偿债压力较大"
+            )
+        elif x1_last < 0.1:
+            yellow_flags.append(f"X1 营运资本/总资产仅 {x1_last:.3f}：流动性偏紧")
+    rd = _rel_delta('z_X1')
+    if rd and rd[0] > 0 and rd[2] < -0.3:
+        yellow_flags.append(
+            f"X1 营运资本/总资产从 {rd[0]:.3f} 降至 {rd[1]:.3f}（相对 {rd[2]*100:+.1f}%）："
+            f"营运资金持续恶化"
+        )
+
+    # ===== 3. X2 留存收益/总资产 (历史包袱) =====
+    x2_last = last.get('z_X2')
+    if x2_last is not None:
+        if x2_last < 0:
+            red_flags.append(
+                f"X2 留存收益/总资产 = {x2_last:.3f} (**为负**)："
+                f"历史累计亏损未填平，是压低 Z 值的核心结构性因素"
+            )
+        elif x2_last < 0.1:
+            yellow_flags.append(f"X2 留存收益/总资产仅 {x2_last:.3f}：盈利积累薄弱")
+    rd = _rel_delta('z_X2')
+    if rd and rd[2] < -0.1 and rd[1] < rd[0] - 0.03:
+        yellow_flags.append(
+            f"X2 留存收益/总资产从 {rd[0]:.3f} 回落到 {rd[1]:.3f}："
+            f"近期亏损或大额分红，侵蚀历史积累"
+        )
+
+    # ===== 4. X3 EBIT/总资产 (核心盈利能力) =====
+    x3_last = last.get('z_X3')
+    if x3_last is not None:
+        if x3_last < 0:
+            red_flags.append(
+                f"X3 EBIT/总资产 = {x3_last:.3f} (**为负**)："
+                f"经营层面出现亏损，核心盈利能力受损"
+            )
+        elif x3_last < 0.03:
+            yellow_flags.append(f"X3 EBIT/总资产仅 {x3_last:.3f}：资产盈利能力极弱")
+    rd = _rel_delta('z_X3')
+    if rd and rd[0] > 0 and rd[2] < -0.3:
+        yellow_flags.append(
+            f"X3 EBIT/总资产从 {rd[0]:.3f} 降至 {rd[1]:.3f}（相对 {rd[2]*100:+.1f}%）："
+            f"核心盈利能力恶化"
+        )
+
+    # ===== 5. X4 权益/负债 (杠杆) =====
+    x4_last = last.get('z_X4')
+    if x4_last is not None:
+        if x4_last < 1.0:
+            red_flags.append(
+                f"X4 权益/负债 = {x4_last:.2f} (**< 1**)："
+                f"负债 > 权益，杠杆水平高，资不抵债风险上升"
+            )
+        elif x4_last < 1.5:
+            yellow_flags.append(f"X4 权益/负债 = {x4_last:.2f}：杠杆偏高")
+    rd = _rel_delta('z_X4')
+    if rd and rd[0] > 0 and rd[2] < -0.3:
+        yellow_flags.append(
+            f"X4 权益/负债从 {rd[0]:.2f} 降至 {rd[1]:.2f}（相对 {rd[2]*100:+.1f}%）："
+            f"负债扩张显著快于权益积累"
+        )
+
+    # ===== 6. X5 营收/总资产 (周转效率) =====
+    x5_last = last.get('z_X5')
+    if x5_last is not None and x5_last < 0.3:
+        yellow_flags.append(
+            f"X5 营收/总资产仅 {x5_last:.3f}：资产过重 / 周转极慢（重资产行业特征）"
+        )
+    if _monotonic_dec('z_X5'):
+        s = [v for _, v in _series('z_X5') if v is not None]
+        yellow_flags.append(
+            f"X5 营收/总资产在 {first_y}–{last_y} 期间**连续下滑** "
+            f"({s[0]:.3f} → {s[-1]:.3f})：营收增长跟不上资产扩张，是 Z 值最大的结构性隐忧"
+        )
+
+    # ===== 7. ROE 质量变差 (杜邦交叉验证) =====
+    if len(years) >= 2:
+        npm1, npm2 = first.get('npm_3'), last.get('npm_3')
+        em1, em2 = first.get('equity_multiplier'), last.get('equity_multiplier')
+        roe1, roe2 = first.get('roe_3'), last.get('roe_3')
+        if all(v is not None for v in [npm1, npm2, em1, em2, roe1, roe2]):
+            # 销售净利率 ↓ + 权益乘数 ↑ = ROE 靠杠杆撑
+            if npm2 < npm1 and em2 > em1 and (roe2 - roe1) * 100 < 2:
+                yellow_flags.append(
+                    f"**ROE 质量恶化**：销售净利率 {_pct(npm1)} → {_pct(npm2)}（下降），"
+                    f"同时权益乘数 {_num(em1)} → {_num(em2)}（上升）—— "
+                    f"ROE 越来越依赖杠杆而非经营盈利"
+                )
+            # ROE 下滑但杠杆也在下滑 → 经营拖累
+            elif roe2 < roe1 and em2 < em1 and (roe2 - roe1) * 100 < -1:
+                yellow_flags.append(
+                    f"ROE 下滑 ({_pct(roe1)} → {_pct(roe2)}) "
+                    f"且权益乘数也下降 ({_num(em1)} → {_num(em2)})："
+                    f"经营层面拖累，杠杆下降未能止血"
+                )
+
+    # ===== 组合输出 =====
+    out: list[str] = []
+    if not red_flags and not yellow_flags:
+        out.append("✅ 未观察到明显风险信号：Z 值及其各分量、杜邦因子均位于健康区间且趋势稳定。")
+        return out
+
+    if red_flags:
+        out.append(f"**🚨 高度警示信号 ({len(red_flags)} 条)**")
+        out.append("")
+        for f in red_flags:
+            out.append(f"- 🚨 {f}")
+        out.append("")
+    if yellow_flags:
+        out.append(f"**⚠️ 关注信号 ({len(yellow_flags)} 条)**")
+        out.append("")
+        for f in yellow_flags:
+            out.append(f"- ⚠️ {f}")
+
+    if red_flags:
+        out.append("")
+        out.append(
+            f"> **综合判读**: 出现 {len(red_flags)} 条高度警示信号，"
+            f"建议结合行业景气度、债务到期结构、现金流覆盖率进一步研判。"
+        )
+    elif yellow_flags:
+        out.append("")
+        out.append(
+            f"> **综合判读**: 暂无致命信号，但有 {len(yellow_flags)} 条关注点，"
+            f"持续观察后续年报是否恶化。"
+        )
+    return out
+
+
 # ===== 主入口 =====
 def main():
     p = argparse.ArgumentParser(
@@ -1091,6 +1284,16 @@ def main():
                 print(f"  {display}")
         print()
 
+    # 6b) 排雷分析 (风险预警)
+    risk_lines = generate_risk_warnings(years, metrics)
+    if risk_lines:
+        print("  [排雷分析]")
+        for line in risk_lines:
+            display = line.lstrip("#").strip() if line.startswith("#") else line
+            if display:
+                print(f"  {display}")
+        print()
+
     # 7) MD 报告 (含趋势分析章节)
     if not args.no_report:
         if args.output:
@@ -1099,7 +1302,7 @@ def main():
             # 默认放到 PDF 目录
             sample_pdf_dir = os.path.dirname(pdfs[0][1])
             out_path = os.path.join(sample_pdf_dir, f"{company}_财务分析.md")
-        write_markdown(company, years, metrics, out_path, trend_lines)
+        write_markdown(company, years, metrics, out_path, trend_lines, risk_lines)
         print(f"📄 MD 报告已保存: {out_path}")
 
 
