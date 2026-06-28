@@ -38,6 +38,11 @@ DEFAULT_REPORTS_ROOT = os.path.join(os.getcwd(), "年报")
 # 限定小数 2 位是为了防止 _flatten 去空白后两个相邻数字被吞并：
 #   "174,144,069,958.25150,560,330,316.45" 中，贪婪 \.\d+ 会把 "25150" 当作小数
 NUM = r"-?\d{1,3}(?:,\d{3})+(?:\.\d{2})?|-?\d+\.\d{2}"
+# 单位 → 乘到「元」的系数。包含百万元（部分央企如中国神华用此单位）
+_UNIT_SCALES = {
+    "元": 1.0, "百元": 100.0, "千元": 1000.0,
+    "万元": 10000.0, "百万元": 1000000.0, "亿元": 100000000.0,
+}
 
 
 # ===== Step 1: 定位公司年报 PDF =====
@@ -111,7 +116,7 @@ def _extract_value(text: str, label_pattern: str, count: int = 2) -> list[float]
     SEP = r"(?:[^\d-]|-(?!\d))"
     pat = re.compile(
         label_pattern
-        + SEP + r"{0,40}?(?:\d{1,3}" + SEP + r"{1,20})?" + SEP + r"{0,20}?"
+        + SEP + r"{0,40}?(?:\d{1,3}" + SEP + r"{1,20}){0,2}?" + SEP + r"{0,20}?"
         + (r"(" + NUM + r")" + SEP + r"{0,20}?") * count
     )
     m = pat.search(flat)
@@ -146,13 +151,22 @@ def parse_pdf(pdf_path: str) -> dict[str, list[float]]:
         start_marker=["合并利润表", "合并及公司利润表"],
         stop_markers=["母公司利润表", "合并现金流量表", "合并所有者权益变动表",
                       "合并及公司现金流量表", "合并及公司所有者权益变动表"],
-        content_hints=["营业收入", "营业总收入", "营业总成本"],
+        # 行项密集：真利润表至少有 4+ 个命中；MD&A/费用表最多 1-2 个
+        content_hints=["营业收入", "营业总收入", "营业总成本",
+                       "利润总额", "所得税费用", "净利润"],
+        # 合并报表独有"营业总收入"（母公司报表只有"营业收入"）
+        # 用于消除"合并 vs 母公司"歧义
+        strong_hints=["营业总收入"],
     )
     balance_pages = _find_section_pages(
         doc,
         start_marker=["合并资产负债表", "合并及公司资产负债表"],
         stop_markers=["母公司资产负债表", "合并利润表", "合并及公司利润表"],
-        content_hints=["资产总计", "流动资产合计", "负债合计"],
+        # 行项密集：真资产负债表至少有 4+ 个命中；MD&A 叙述最多 1-2 个
+        content_hints=["流动资产合计", "流动负债合计", "资产总计",
+                       "负债合计", "所有者权益合计"],
+        # 合并报表独有"归属于母公司"或"少数股东权益"
+        strong_hints=["归属于母公司", "少数股东权益"],
     )
 
     income_text = "\n".join(doc[i].get_text() for i in income_pages) if income_pages else ""
@@ -184,6 +198,9 @@ def parse_pdf(pdf_path: str) -> dict[str, list[float]]:
         _flexible_label('归属于母公司所有者的净利润（净亏损以"-"号填列）'),
         _flexible_label("归属于母公司股东的净利润"),
         _flexible_label("归属于母公司所有者的净利润"),
+        # 中兴通讯: "归属于母公司普通股股东" 后直接跟数值（无"的净利润"后缀）
+        # 用负向先行断言排除 "...的其他综合收益" / "...的综合收益总额"
+        r"归属于母公司普通股股东(?![的综合])",
         _flexible_label("净利润（净亏损"),
         r"净利润\(净亏损",
     ])
@@ -205,8 +222,12 @@ def parse_pdf(pdf_path: str) -> dict[str, list[float]]:
     out['equity_parent'] = extract_with_fallback(balance_text, [
         _flexible_label("归属于母公司所有者权益合计"),
         _flexible_label("归属于母公司所有者权益（或股东权益）合计"),
+        # 国投电力等用 ASCII 括号 "(或股东权益)" 且括号内有空格
+        r"归属于母公司所有者权益\(\s*或股东权益\s*\)\s*合计",
         _flexible_label("归属于母公司股东权益合计"),
         _flexible_label("归属于母公司股东权益（或股东权益）合计"),
+        # 中兴通讯: "归属于母公司普通股股东权益合计"
+        _flexible_label("归属于母公司普通股股东权益合计"),
         _flexible_label("所有者权益（或股东权益）合计"),
         r"(?<![司])" + _flexible_label("所有者权益合计"),
     ])
@@ -225,8 +246,7 @@ def parse_pdf(pdf_path: str) -> dict[str, list[float]]:
     return out
 
 
-# 单位 → 元 的乘数
-_UNIT_SCALES = {"元": 1.0, "百元": 1e2, "千元": 1e3, "万元": 1e4, "亿元": 1e8}
+# 单位 → 元 的乘数（已在模块顶部定义 _UNIT_SCALES 含百万元）
 
 
 def _detect_unit_scale(doc) -> float:
@@ -246,18 +266,33 @@ def _detect_unit_scale(doc) -> float:
     # 优先级 1: 全局声明
     for i in range(min(doc.page_count, 200)):
         t = doc[i].get_text()
-        m = re.search(r"财务附注中报表的单位为[：:]\s*(元|千元|百元|万元|亿元)", t)
+        m = re.search(r"财务附注中报表的单位为[：:]\s*(元|千元|百元|万元|百万元|亿元)", t)
         if m:
             return _UNIT_SCALES[m.group(1)]
 
     # 优先级 2: 报表页头单位标注
     # 兼容多种写法: "单位：元" / "单位:人民币千元" / "金额单位为人民币千元" / "（金额单位：人民币元）"
+    #              / "人民币千元" (中兴通讯/青岛啤酒 单独成行无"单位"前缀)
+    #              / "人民币百万元" (中国神华 等央企)
     # 必须同时满足：(a) 含报表段标记 (b) 含报表行项 (c) 数值密度高（真报表页有几十个数字单元格）
     # 避免审计/薪酬/股权激励等章节也提到"合并资产负债表"导致误判
     # （海尔智家 p93 审计师费用表 + p93 会计政策叙述都误中过）
     statement_markers = ("合并资产负债表", "合并利润表",
                          "合并及公司资产负债表", "合并及公司利润表")
     line_item_hints = ("营业收入", "营业总收入", "资产总计", "营业成本")
+    # 单位 token 两种模式：
+    #   带前缀: "单位..." / "金额单位..." / "(金额单位...)" 等
+    #   无前缀: "人民币X元" 必须单独成行（中兴/青啤风格）
+    # ⚠️ 裸 "人民币X元" 必须用 ^...$ 锚定整行，否则正文叙述里
+    #    "折算为人民币百万元" / "以人民币千元为单位" 等会误匹配
+    #    （曾导致 泸州老窖/天齐锂业 营收被错误除以 1e6）
+    unit_re = re.compile(
+        r"(?:单位[^元千百万]{0,8}|金额单位[^元千百万]{0,8})"
+        r"(?:人民币)?\s*(元|千元|百元|万元|百万元|亿元)"
+        r"|^\s*(?:编制单位[:：][^\n]*\n)?人民币\s*(百万元|千元|百元|万元|亿元|元)\s*(?:\n|$)"
+        r"|^\s*金额单位[:：]\s*人民币\s*(百万元|千元|百元|万元|亿元|元)\s*(?:\n|$)",
+        re.MULTILINE,
+    )
     for i in range(doc.page_count):
         t = doc[i].get_text()
         if not any(m in t for m in statement_markers):
@@ -266,9 +301,11 @@ def _detect_unit_scale(doc) -> float:
             continue
         if len(re.findall(r"\d[\d,]{3,}", t)) < 15:  # 真报表页至少 15 个 4 位以上数字
             continue
-        m = re.search(r"单位[^元千百万]{0,8}(?:人民币)?\s*(元|千元|百元|万元|亿元)", t)
+        m = unit_re.search(t)
         if m:
-            return _UNIT_SCALES[m.group(1)]
+            token = next((g for g in m.groups() if g), None)
+            if token:
+                return _UNIT_SCALES[token]
 
     # 优先级 3: 数值幅度启发式
     # 找合并资产负债表页，取「资产总计」值判断单位
@@ -293,7 +330,9 @@ def _detect_unit_scale(doc) -> float:
 
 def _find_section_pages(doc, start_marker, stop_markers: list[str],
                        max_pages: int = 6, content_hints: list[str] | None = None,
-                       min_numeric_density: int = 15) -> list[int]:
+                       min_numeric_density: int = 15,
+                       min_hits_tier2: int = 3,
+                       strong_hints: list[str] | None = None) -> list[int]:
     """
     定位从 start_marker 开始、到任一 stop_marker 之前的页范围。
     - start_marker 可以是 str 或 list[str]（任一匹配即视为起点，用于兼容
@@ -307,6 +346,14 @@ def _find_section_pages(doc, start_marker, stop_markers: list[str],
     - min_numeric_density: start 页需至少含此数量的「4 位以上数字串」。
       真报表页有几十/上百个数字单元格；审计/正文叙述页一般 < 15。
       设为 0 可禁用此启发式。
+    - min_hits_tier2: 退化 1（无 marker fallback）时，要求 content_hints 中
+      **至少 N 个**同时在页面出现（默认 3）。
+    - strong_hints: 退化 1 中，含这些"强信号"的页优先（score +1000）。
+      用于消除"合并报表 vs 母公司报表"歧义：合并利润表独有"营业总收入"，
+      母公司利润表没有；合并资产负债表独有"归属于母公司"/"少数股东权益"。
+      典型踩坑：泸州老窖 2025 合并利润表跨 p78+p79（每页 3 个 hint），
+      母公司利润表 p80 单页命中 4 个 hint —— 按 max-hints 选了 p80（错）。
+      加 strong_hints=["营业总收入"] 后 p78 得分 1003 > p80 的 4，正确选 p78。
     """
     if isinstance(start_marker, str):
         markers = [start_marker]
@@ -320,22 +367,86 @@ def _find_section_pages(doc, start_marker, stop_markers: list[str],
         # 4 位及以上的数字串个数（含千分位逗号）。真报表页通常 > 30；叙述页 < 15。
         return len(re.findall(r"\d[\d,]{3,}", text))
 
+    def _hint_count(text: str) -> int:
+        if not content_hints:
+            return 0
+        return sum(1 for h in content_hints if h in text)
+
+    def _has_strong(text: str) -> bool:
+        if not strong_hints:
+            return False
+        return any(h in text for h in strong_hints)
+
+    page_texts = [doc[i].get_text() for i in range(doc.page_count)]
+    summary_markers = ("主要会计数据", "主要财务指标", "加权平均净资产收益率",
+                        "每股收益")
+
+    # Tier 1: 有 marker + 至少 2 个 content_hints + 高密度
+    # （之前的 "marker + any hint" 太松：福耀玻璃 p14 MD&A 叙述提到"合并利润表"
+    # 加 1 个"营业收入"词就过门槛；改为 2+ hints 可靠区分真报表 vs MD&A 叙述）
     start = None
     for i in range(doc.page_count):
-        t = doc[i].get_text()
+        t = page_texts[i]
         if not _has_any_marker(t):
             continue
-        if content_hints and not any(h in t for h in content_hints):
+        if any(m in t for m in summary_markers):
             continue
         if min_numeric_density > 0 and _numeric_density(t) < min_numeric_density:
             continue
+        if content_hints and _hint_count(t) < 2:
+            continue
         start = i
         break
-    if start is None:
-        # 退化: 不要求 content_hints / 数值密度
+
+    # Tier 2: 无 marker 或 Tier 1 失败时的 fallback —— 合并报表强信号驱动
+    # 适用：泸州老窖/海大集团/福耀玻璃 等年报真报表页没有/被叙述页抢走 marker
+    if start is None and content_hints and min_numeric_density > 0:
+        strong_candidates: list[tuple[int, int]] = []  # (page_idx, hint_count)
+        weak_candidates: list[tuple[int, int]] = []
         for i in range(doc.page_count):
-            if _has_any_marker(doc[i].get_text()):
+            t = page_texts[i]
+            if any(m in t for m in summary_markers):
+                continue
+            if min_numeric_density > 0 and _numeric_density(t) < min_numeric_density:
+                continue
+            hc = _hint_count(t)
+            # lookahead 窗口: 当前页 + 后续 1 页（资产负债表跨页通常 2 页内）
+            # 不用 max_pages 是避免窗口过宽泄漏到下一个报表（如合并资产负债表
+            # 之后的合并利润表也含"归属于母公司股东的净利润"，会误判）
+            window_end = min(i + 2, doc.page_count)
+            window_text = "\n".join(page_texts[i:window_end])
+            has_strong_in_window = _has_strong(window_text)
+            # 候选资格:
+            #   - hint ≥ min_hits_tier2 (高密度真报表页)，或
+            #   - hint ≥ 2 且 lookahead 含 strong hint (合并报表首卷页)
+            # 双条件防误判：strong_hints 如"归属于母公司"/"少数股东权益" 也可能
+            # 出现在 MD&A 的"其他综合收益"/"股东权益变动" 等章节，必须再叠加
+            # hint_count ≥ 2 的硬条件（茅台 p6 综合收益表命中 strong 但 hintB=0）
+            if hc < 2:
+                continue
+            if hc < min_hits_tier2 and not has_strong_in_window:
+                continue
+            if has_strong_in_window:
+                strong_candidates.append((i, hc))
+            else:
+                weak_candidates.append((i, hc))
+        if strong_candidates:
+            # 取页码最小的（首卷报表在前）
+            start = min(c[0] for c in strong_candidates)
+        elif weak_candidates:
+            # 退化: 取 hint_count 最大的（同分取首页）
+            best = max(min_hits_tier2 - 1, 0)
+            for idx, hc in weak_candidates:
+                if hc > best:
+                    best = hc
+                    start = idx
+
+    if start is None:
+        # Tier 3: marker only（最终兜底）
+        for i in range(doc.page_count):
+            if _has_any_marker(page_texts[i]):
                 start = i
+                break
                 break
     if start is None:
         return []
